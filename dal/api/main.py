@@ -12,10 +12,12 @@ from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
+from datetime import date as date_type
 from db.database import get_session, create_all
 from db.models import (
     ActivityEvent, EsmResponse, EsmCorrection, StandardTime, Participant,
     ClassifiedBlock, Study, Role, ActivityCatalog, User, AuditLog,
+    Organization, Volume,
 )
 from auth import security as sec
 from engine.classify import classify_study
@@ -70,6 +72,33 @@ class StudyIn(BaseModel):
     end_date: str
     retention_days: int = 30
 
+class RoleIn(BaseModel):
+    study_id: str
+    name: str
+    role_family: str
+    current_headcount: int = 1
+    available_minutes_per_day: int = 420
+    cyclical: bool = False
+
+class OrgIn(BaseModel):
+    name: str
+
+class CorrectionIn(BaseModel):
+    block_id: int
+    new_classification: str  # VA|NVA_necessary|NVA_waste
+    new_activity_id: Optional[str] = None
+
+class VolumeIn(BaseModel):
+    study_id: str
+    activity_id: str
+    period: str  # YYYY-MM-DD
+    count: int
+
+class StandardTimeIn(BaseModel):
+    activity_id: str
+    std_minutes_per_unit: float
+    method: str = "engineered"
+
 
 # ---------------- auth ----------------
 @app.post("/auth/login")
@@ -96,6 +125,12 @@ def consent(body: ConsentIn, user: User = Depends(sec.require_role("participant"
     p = db.get(Participant, user.participant_id)
     p.consent_status = "given" if body.given else "withdrawn"
     sec.audit(db, user, "consent", p.consent_status)
+    # PRD §F6: withdrawal immediately purges that participant's raw data
+    if not body.given:
+        db.query(ActivityEvent).filter_by(participant_id=p.id).delete()
+        db.query(EsmResponse).filter_by(participant_id=p.id).delete()
+        db.query(ClassifiedBlock).filter_by(participant_id=p.id).delete()
+        sec.audit(db, user, "withdrawal_purge", p.id)
     db.commit()
     return {"consent_status": p.consent_status}
 
@@ -127,6 +162,26 @@ def attribute(body: AttributeIn, user: User = Depends(sec.require_role("particip
     if not ev or ev.participant_id != user.participant_id:
         raise HTTPException(404, "gap not found")
     idle_gaps.attribute_gap(db, body.event_id, body.choice)
+    return {"ok": True}
+
+@app.post("/esm/correction")
+def post_correction(body: CorrectionIn,
+                    user: User = Depends(sec.require_role("participant")),
+                    db: Session = Depends(get_session)):
+    """Log a timeline correction (PRD §B3.2, §G4). Stores before/after for bias analysis."""
+    blk = db.get(ClassifiedBlock, body.block_id)
+    if not blk or blk.participant_id != user.participant_id:
+        raise HTTPException(404, "block not found")
+    db.add(EsmCorrection(
+        participant_id=user.participant_id,
+        old_classification=blk.classification,
+        new_classification=body.new_classification,
+    ))
+    blk.consultant_override = body.new_classification
+    if body.new_activity_id:
+        blk.activity_id = body.new_activity_id
+    sec.audit(db, user, "esm_correction", str(body.block_id))
+    db.commit()
     return {"ok": True}
 
 @app.get("/esm-app", response_class=HTMLResponse)
@@ -169,7 +224,83 @@ def train_ml(study_id: str, user: User = Depends(sec.require_role("consultant"))
 def get_validity(study_id: str, user: User = Depends(sec.require_role("consultant")),
                  db: Session = Depends(get_session)):
     return {"divergences": validity.divergences(db, study_id),
-            "peer_outliers": validity.peer_outliers(db, study_id)}
+            "peer_outliers": validity.peer_outliers(db, study_id),
+            "correction_bias": validity.correction_bias(db, study_id)}
+
+# ---------------- study setup (wizard) ----------------
+@app.post("/orgs")
+def create_org(body: OrgIn, user: User = Depends(sec.require_role("consultant")),
+               db: Session = Depends(get_session)):
+    org = Organization(name=body.name)
+    db.add(org)
+    sec.audit(db, user, "create_org", org.id)
+    db.commit()
+    return {"id": org.id, "name": org.name}
+
+@app.get("/orgs")
+def list_orgs(user: User = Depends(sec.require_role("consultant")),
+              db: Session = Depends(get_session)):
+    return [{"id": o.id, "name": o.name} for o in db.query(Organization).all()]
+
+@app.post("/studies")
+def create_study(body: StudyIn, user: User = Depends(sec.require_role("consultant")),
+                 db: Session = Depends(get_session)):
+    study = Study(org_id=body.org_id, name=body.name,
+                  start_date=body.start_date, end_date=body.end_date,
+                  data_scope={"retention_days": body.retention_days})
+    db.add(study)
+    sec.audit(db, user, "create_study", study.id)
+    db.commit()
+    return {"id": study.id}
+
+@app.post("/roles")
+def create_role(body: RoleIn, user: User = Depends(sec.require_role("consultant")),
+                db: Session = Depends(get_session)):
+    role = Role(**body.model_dump())
+    db.add(role)
+    db.commit()
+    return {"id": role.id}
+
+@app.post("/volumes")
+def add_volume(body: VolumeIn, user: User = Depends(sec.require_role("consultant")),
+               db: Session = Depends(get_session)):
+    from datetime import date as _date
+    vol = Volume(study_id=body.study_id, activity_id=body.activity_id,
+                 period=_date.fromisoformat(body.period), count=body.count)
+    db.add(vol)
+    db.commit()
+    return {"ok": True}
+
+@app.post("/studies/{study_id}/standard-times")
+def set_standard_time(study_id: str, body: StandardTimeIn,
+                      user: User = Depends(sec.require_role("consultant")),
+                      db: Session = Depends(get_session)):
+    existing = db.query(StandardTime).filter_by(
+        study_id=study_id, activity_id=body.activity_id).first()
+    if existing:
+        existing.std_minutes_per_unit = body.std_minutes_per_unit
+        existing.method = body.method
+        existing.set_by = user.email
+    else:
+        db.add(StandardTime(study_id=study_id, activity_id=body.activity_id,
+                            std_minutes_per_unit=body.std_minutes_per_unit,
+                            method=body.method, set_by=user.email))
+    sec.audit(db, user, "set_standard_time", body.activity_id)
+    db.commit()
+    return {"ok": True}
+
+@app.get("/studies/{study_id}/report/pptx")
+def get_pptx(study_id: str, user: User = Depends(sec.require_role("consultant")),
+             db: Session = Depends(get_session)):
+    from fastapi.responses import FileResponse
+    import tempfile
+    from reports.generate import generate_pptx
+    tmp = tempfile.mktemp(suffix=".pptx")
+    generate_pptx(db, study_id, out_path=tmp)
+    sec.audit(db, user, "export_pptx", study_id)
+    db.commit()
+    return FileResponse(tmp, media_type="application/vnd.openxmlformats-officedocument.presentationml.presentation",
+                        filename="study_report.pptx")
 
 
 # ---------------- admin: retention + audit ----------------

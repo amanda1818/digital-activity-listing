@@ -62,6 +62,8 @@ def _claude_classify(event, candidates):
 
 def classify_study(session, study_id, use_ai=True):
     """Build classified_blocks for every participant in the study."""
+    from engine import ml_classify  # avoid circular at module level
+
     # clear previous run
     p_ids = [p.id for p in session.query(Participant).filter_by(study_id=study_id).all()]
     if p_ids:
@@ -81,9 +83,16 @@ def classify_study(session, study_id, use_ai=True):
 
         for ev in events:
             minutes = (ev.end_ts - ev.start_ts).total_seconds() / 60.0
+            text = f"{ev.app_name} {ev.window_title_hash} {ev.category}"
             # Pass 1: rules
-            act, conf = _match_rule(f"{ev.app_name} {ev.window_title_hash} {ev.category}", catalog_rows)
-            # Pass 2: AI only if rules failed
+            act, conf = _match_rule(text, catalog_rows)
+            # Pass 1.5: trained ML model (reduces AI API calls as data accumulates; PRD §C3.2)
+            if act is None:
+                ml = ml_classify.predict(text)
+                if ml and ml[0] in cat_by_id and ml[1] >= config.CONFIDENCE_REVIEW_THRESHOLD:
+                    act = cat_by_id[ml[0]]
+                    conf = ml[1]
+            # Pass 2: AI only if rules and ML both failed
             if act is None and use_ai:
                 ai = _claude_classify(ev, catalog_rows)
                 if ai and ai[0] in cat_by_id:
