@@ -5,6 +5,7 @@ pydantic>=2.6
 pandas>=2.2
 numpy>=1.26
 streamlit>=1.33
+python-docx>=1.1
 python-pptx>=0.6.23
 anthropic>=0.25
 python-dotenv>=1.0
